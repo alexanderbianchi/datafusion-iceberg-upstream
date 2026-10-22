@@ -84,17 +84,16 @@ impl ReadStrategy {
                 let metrics = ExecutionPlanMetricsSet::new();
                 let output_schema = schema.clone();
                 let stream = futures::stream::once(async move {
-                    let mut tasks = tasks;
-                    let mut streams = Vec::new();
-                    while let Some(task) =
-                        tasks.try_next().await.map_err(to_datafusion_error)?
-                    {
-                        streams.push(read_files(
-                            reader.clone(),
-                            futures::stream::iter([Ok(task)]).boxed(),
-                            schema.clone(),
-                        )?);
-                    }
+                    let streams = tasks
+                        .map(|task| {
+                            read_file(
+                                reader.clone(),
+                                task.map_err(to_datafusion_error)?,
+                                schema.clone(),
+                            )
+                        })
+                        .try_collect::<Vec<_>>()
+                        .await?;
                     let reservation = MemoryConsumer::new(format!(
                         "Iceberg ordered merge[{partition}]"
                     ))
@@ -118,6 +117,14 @@ impl ReadStrategy {
             }
         }
     }
+}
+
+fn read_file(
+    reader: ArrowReader,
+    task: FileScanTask,
+    schema: SchemaRef,
+) -> Result<SendableRecordBatchStream> {
+    read_files(reader, futures::stream::iter([Ok(task)]).boxed(), schema)
 }
 
 fn read_files(
