@@ -3247,7 +3247,6 @@ dependencies = [
  "insta",
  "parquet",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "typetag",

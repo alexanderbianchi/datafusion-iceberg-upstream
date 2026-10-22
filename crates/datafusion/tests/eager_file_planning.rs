@@ -15,43 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::error::Error;
-use std::fs;
-use std::io;
-use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{Result, stats::Precision};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::common::collect;
+use datafusion::physical_plan::{ExecutionPlanProperties, collect as collect_plan};
 use datafusion::prelude::{SessionConfig, col, lit};
 use datafusion::scalar::ScalarValue;
-use iceberg::Runtime;
-use iceberg::metadata_columns::{
-    RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
-    RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
-};
-use iceberg::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter,
-    ManifestWriterBuilder, TableMetadata,
-};
-use iceberg::table::Table;
 use iceberg_datafusion::read::IcebergDataSource;
 use iceberg_datafusion::test_utils::IcebergTestHarness;
 use iceberg_datafusion::{
     IcebergCatalogTableProvider, IcebergPlanningConfig, IcebergStaticTableProvider,
 };
-use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
-use serde_json::{Value, json};
-use tempfile::TempDir;
+
+mod common;
+
+use common::position_deletes::taxi_with_position_delete;
 
 fn eager_config() -> SessionConfig {
     SessionConfig::new()
@@ -68,20 +53,6 @@ fn iceberg_source(
         .data_source()
         .downcast_ref::<IcebergDataSource>()
         .expect("the plan contains the Iceberg data source")
-}
-
-fn copy_fixture(from: &Path, to: &Path) -> io::Result<()> {
-    fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let destination = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_fixture(&entry.path(), &destination)?;
-        } else {
-            fs::copy(entry.path(), destination)?;
-        }
-    }
-    Ok(())
 }
 
 #[tokio::test]
@@ -204,141 +175,9 @@ async fn eager_ordered_limit_matches_lazy_results() -> Result<()> {
 
 #[tokio::test]
 async fn eager_and_lazy_scans_apply_position_deletes() -> StdResult<(), Box<dyn Error>> {
-    // Isolate the checked-in fixture: the test writes a new delete manifest and
-    // snapshot, but must not modify the files used by other tests.
-    let temporary = TempDir::new()?;
-    let root = temporary.path().join("iceberg");
-    copy_fixture(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/iceberg"),
-        &root,
-    )?;
-    let eager = IcebergTestHarness::with_fixture_root(eager_config(), root).await?;
-    let provider = eager.context().table_provider("taxi").await?;
-    let catalog_provider = provider
-        .downcast_ref::<IcebergCatalogTableProvider>()
-        .expect("the fixture creates a catalog Iceberg provider");
-    let table = catalog_provider
-        .catalog()
-        .load_table(catalog_provider.table_ident())
-        .await?;
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .expect("fixture has a snapshot");
-    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-    let data_manifest = table
-        .manifest_reader()
-        .read(&manifest_list.entries()[0])
-        .await?;
-    let data_file = &data_manifest.entries()[0].data_file;
-
-    let delete_path = "s3://iceberg-test/warehouse/taxi/data/pos-delete.parquet";
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(RESERVED_COL_NAME_DELETE_FILE_PATH, DataType::Utf8, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                RESERVED_FIELD_ID_DELETE_FILE_PATH.to_string(),
-            )])),
-        Field::new(RESERVED_COL_NAME_DELETE_FILE_POS, DataType::Int64, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                RESERVED_FIELD_ID_DELETE_FILE_POS.to_string(),
-            )])),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec![data_file.file_path()])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![0])) as ArrayRef,
-        ],
-    )?;
-    let delete_file_on_disk = temporary
-        .path()
-        .join("iceberg/taxi/data/pos-delete.parquet");
-    let mut writer =
-        ArrowWriter::try_new(fs::File::create(&delete_file_on_disk)?, schema, None)?;
-    writer.write(&batch)?;
-    writer.close()?;
-    let delete_size = fs::metadata(&delete_file_on_disk)?.len();
-
-    let next_snapshot_id = snapshot.snapshot_id() + 1;
-    let mut delete_manifest = ManifestWriterBuilder::new(
-        table
-            .file_io()
-            .new_output("s3://iceberg-test/warehouse/taxi/metadata/pos-delete.avro")?,
-        Some(next_snapshot_id),
-        snapshot.schema(table.metadata())?,
-        table.metadata().default_partition_spec().as_ref().clone(),
-    )
-    .build_v2_deletes();
-    delete_manifest.add_file(
-        DataFileBuilder::default()
-            .partition_spec_id(table.metadata().default_partition_spec_id())
-            .content(DataContentType::PositionDeletes)
-            .file_path(delete_path.to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(delete_size)
-            .record_count(1)
-            .partition(data_file.partition().clone())
-            .build()?,
-        -1,
-    )?;
-    let delete_manifest = delete_manifest.write_manifest_file().await?;
-    let manifest_list_path =
-        "s3://iceberg-test/warehouse/taxi/metadata/snap-with-delete.avro";
-    let mut writer = ManifestListWriter::v2(
-        table
-            .file_io()
-            .new_output(manifest_list_path)?
-            .writer()
-            .await?,
-        next_snapshot_id,
-        Some(snapshot.snapshot_id()),
-        snapshot.sequence_number() + 1,
-    );
-    writer.add_manifests(
-        manifest_list
-            .entries()
-            .iter()
-            .cloned()
-            .chain([delete_manifest]),
-    )?;
-    writer.close().await?;
-
-    let mut metadata: Value = serde_json::from_slice(&fs::read(
-        temporary
-            .path()
-            .join("iceberg/taxi/metadata/v1.metadata.json"),
-    )?)?;
-    let mut new_snapshot = metadata["snapshots"][0].clone();
-    new_snapshot["snapshot-id"] = json!(next_snapshot_id);
-    new_snapshot["parent-snapshot-id"] = json!(snapshot.snapshot_id());
-    new_snapshot["sequence-number"] = json!(snapshot.sequence_number() + 1);
-    new_snapshot["manifest-list"] = json!(manifest_list_path);
-    new_snapshot["timestamp-ms"] = json!(snapshot.timestamp_ms() + 1);
-    new_snapshot["summary"]["total-delete-files"] = json!("1");
-    new_snapshot["summary"]["total-position-deletes"] = json!("1");
-    metadata["current-snapshot-id"] = json!(next_snapshot_id);
-    metadata["last-sequence-number"] = json!(snapshot.sequence_number() + 1);
-    metadata["last-updated-ms"] = json!(snapshot.timestamp_ms() + 1);
-    metadata["refs"]["main"]["snapshot-id"] = json!(next_snapshot_id);
-    metadata["snapshot-log"]
-        .as_array_mut()
-        .expect("fixture has a snapshot log")
-        .push(json!({
-            "snapshot-id": next_snapshot_id,
-            "timestamp-ms": snapshot.timestamp_ms() + 1,
-        }));
-    metadata["snapshots"]
-        .as_array_mut()
-        .expect("fixture has snapshots")
-        .push(new_snapshot);
-    let table = Table::builder()
-        .file_io(table.file_io().clone())
-        .identifier(table.identifier().clone())
-        .metadata(serde_json::from_value::<TableMetadata>(metadata)?)
-        .runtime(Runtime::try_current()?)
-        .build()?;
+    let fixture = taxi_with_position_delete().await?;
+    let eager = IcebergTestHarness::with_config(eager_config()).await?;
+    let table = fixture.table.clone();
     let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
     let lazy_state = IcebergTestHarness::with_config(SessionConfig::new()).await?;
 
@@ -365,16 +204,10 @@ async fn eager_and_lazy_scans_apply_position_deletes() -> StdResult<(), Box<dyn 
     let lazy_plan = provider
         .scan(&lazy_state.context().state(), None, &[], None)
         .await?;
-    let mut eager_rows = 0;
-    for partition in 0..eager_plan.output_partitioning().partition_count() {
-        for batch in collect(eager_plan.execute(partition, state.task_ctx())?).await? {
-            eager_rows += batch.num_rows();
-        }
-    }
-    let mut lazy_rows = 0;
-    for batch in collect(lazy_plan.execute(0, lazy_state.context().task_ctx())?).await? {
-        lazy_rows += batch.num_rows();
-    }
+    let eager_batches = collect_plan(eager_plan, state.task_ctx()).await?;
+    let lazy_batches = collect_plan(lazy_plan, lazy_state.context().task_ctx()).await?;
+    let eager_rows: usize = eager_batches.iter().map(|batch| batch.num_rows()).sum();
+    let lazy_rows: usize = lazy_batches.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(lazy_rows, 174_999);
     assert_eq!(eager_rows, lazy_rows);
     Ok(())
