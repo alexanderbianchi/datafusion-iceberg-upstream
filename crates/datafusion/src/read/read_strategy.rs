@@ -32,7 +32,7 @@ use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{ArrowReader, schema_to_arrow_schema};
-use iceberg::scan::{FileScanTask, FileScanTaskStream};
+use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     NullOrder, PrimitiveType, Schema, SortDirection, SortOrder, Transform, Type,
 };
@@ -79,7 +79,18 @@ pub(crate) fn read_ordered<'a>(
     context: &TaskContext,
 ) -> Result<SendableRecordBatchStream> {
     let streams = tasks
-        .map(|task| read_file(reader.clone(), task.clone(), schema.clone()))
+        .map(|task| {
+            let stream = reader
+                .clone()
+                .read(futures::stream::iter([Ok(task.clone())]).boxed())
+                .map_err(to_datafusion_error)?
+                .stream()
+                .map_err(to_datafusion_error);
+            Ok(
+                Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream))
+                    as SendableRecordBatchStream,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let reservation = MemoryConsumer::new(format!("Iceberg ordered merge[{partition}]"))
         .register(context.memory_pool());
@@ -93,27 +104,6 @@ pub(crate) fn read_ordered<'a>(
         .with_batch_size(context.session_config().batch_size())
         .with_reservation(reservation)
         .build()
-}
-
-fn read_file(
-    reader: ArrowReader,
-    task: FileScanTask,
-    schema: SchemaRef,
-) -> Result<SendableRecordBatchStream> {
-    read_files(reader, futures::stream::iter([Ok(task)]).boxed(), schema)
-}
-
-pub(crate) fn read_files(
-    reader: ArrowReader,
-    tasks: FileScanTaskStream,
-    schema: SchemaRef,
-) -> Result<SendableRecordBatchStream> {
-    let stream = reader
-        .read(tasks)
-        .map_err(to_datafusion_error)?
-        .stream()
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
 /// The order of the columns of `output` that every one of `tasks` is sorted

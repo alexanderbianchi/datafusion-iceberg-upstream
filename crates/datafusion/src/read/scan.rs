@@ -27,6 +27,7 @@ use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
@@ -37,7 +38,7 @@ use iceberg::table::Table;
 
 use super::file_planning::PlannedFileScan;
 use super::predicate::convert_filters_to_predicate;
-use super::read_strategy::{ReadStrategy, read_files, read_ordered};
+use super::read_strategy::{ReadStrategy, read_ordered};
 use crate::{IcebergPlanningConfig, to_datafusion_error};
 
 // A reader is created once per physical scan. Its clones share the delete loader's
@@ -441,7 +442,16 @@ impl DataSource for IcebergDataSource {
                         )
                     }
                 };
-                read_files(self.reader.0.clone(), tasks, self.schema.clone())?
+                let stream = self
+                    .reader
+                    .0
+                    .clone()
+                    .read(tasks)
+                    .map_err(to_datafusion_error)?
+                    .stream()
+                    .map_err(to_datafusion_error);
+                Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
+                    as SendableRecordBatchStream
             }
         };
         Ok(Box::pin(LimitStream::new(
