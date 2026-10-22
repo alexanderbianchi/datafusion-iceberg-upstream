@@ -33,7 +33,7 @@ use iceberg_datafusion::IcebergPlanningConfig;
 
 let config = SessionConfig::new()
     .with_option_extension(IcebergPlanningConfig::default())
-    .set_bool("iceberg_local.eager_file_planning", true);
+    .set_bool("iceberg.eager_file_planning", true);
 ```
 
 ### Behavior
@@ -55,5 +55,5 @@ that stop early. Repeated provider scans repeat planning. The planning caller
 must support metadata I/O: Iceberg's initial manifest-list read still runs on
 that runtime, even when the table has a separate I/O runtime.
 
-The `iceberg_local` prefix allows these options to coexist with DataFusion
-Distributed's `iceberg` options.
+Register only one configuration extension under the `iceberg` prefix per session.
+DataFusion Distributed currently uses that same prefix for its own options.

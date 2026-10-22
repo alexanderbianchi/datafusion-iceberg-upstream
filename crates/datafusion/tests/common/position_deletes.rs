@@ -17,181 +17,176 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::fs;
-use std::io;
-use std::path::Path;
+use std::fs::File;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::prelude::SessionConfig;
-use iceberg::Runtime;
+use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use iceberg::io::FileIO;
 use iceberg::metadata_columns::{
     RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use iceberg::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Snapshot, Summary,
+    DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, ManifestListWriter,
+    ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Schema, Snapshot,
+    SortOrder, Struct, Summary, TableMetadataBuilder, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
-use iceberg_datafusion::IcebergCatalogTableProvider;
-use iceberg_datafusion::test_utils::IcebergTestHarness;
+use iceberg::{Runtime, TableIdent};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use tempfile::TempDir;
 
-/// A taxi table with its first data file's first row deleted.
-/// Owns the copied files for the lifetime of scans against this table.
+/// Two data files containing IDs [0, 1] and [2, 3], with ID 0 position-deleted.
+/// Keeps the generated files alive while the table is scanned.
 pub struct PositionDeleteFixture {
     pub table: Table,
     _directory: TempDir,
 }
 
-pub async fn taxi_with_position_delete() -> Result<PositionDeleteFixture, Box<dyn Error>>
+pub async fn table_with_position_delete() -> Result<PositionDeleteFixture, Box<dyn Error>>
 {
-    // Isolate the checked-in fixture: the test writes a new delete manifest and
-    // snapshot, but must not modify the files used by other tests.
-    let temporary = TempDir::new()?;
-    let root = temporary.path().join("iceberg");
-    copy_fixture(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/iceberg"),
-        &root,
-    )?;
-    let harness =
-        IcebergTestHarness::with_fixture_root(SessionConfig::new(), root).await?;
-    let provider = harness.context().table_provider("taxi").await?;
-    let catalog_provider = provider
-        .downcast_ref::<IcebergCatalogTableProvider>()
-        .expect("the fixture creates a catalog Iceberg provider");
-    let table = catalog_provider
-        .catalog()
-        .load_table(catalog_provider.table_ident())
-        .await?;
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .expect("fixture has a snapshot");
-    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-    let data_manifest = table
-        .manifest_reader()
-        .read(&manifest_list.entries()[0])
-        .await?;
-    let data_file = &data_manifest.entries()[0].data_file;
+    let directory = TempDir::new()?;
+    let root = directory.path().to_str().unwrap();
+    let io = FileIO::new_with_fs();
+    let schema = Schema::builder()
+        .with_fields([NestedField::required(
+            1,
+            "id",
+            Type::Primitive(PrimitiveType::Long),
+        )
+        .into()])
+        .build()?;
+    let metadata = TableMetadataBuilder::new(
+        schema,
+        UnboundPartitionSpec::default(),
+        SortOrder::unsorted_order(),
+        root.to_string(),
+        FormatVersion::V2,
+        HashMap::new(),
+    )?
+    .build()?
+    .metadata;
+    let schema = metadata.current_schema().clone();
+    let spec = metadata.default_partition_spec().as_ref().clone();
+    let mut data_manifest = ManifestWriterBuilder::new(
+        io.new_output(format!("{root}/data.avro"))?,
+        Some(2),
+        schema.clone(),
+        spec.clone(),
+    )
+    .build_v2_data();
+    let data_schema = Arc::new(ArrowSchema::new(vec![field("id", DataType::Int64, 1)]));
+    for file in 0..2 {
+        let path = format!("{root}/data-{file}.parquet");
+        let batch = RecordBatch::try_new(
+            data_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![file * 2, file * 2 + 1]))],
+        )?;
+        let size = write_parquet(&path, batch)?;
+        data_manifest.add_file(
+            DataFileBuilder::default()
+                .partition_spec_id(0)
+                .content(DataContentType::Data)
+                .file_path(path)
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(size)
+                .record_count(2)
+                .partition(Struct::empty())
+                .build()?,
+            1,
+        )?;
+    }
+    let data_manifest = data_manifest.write_manifest_file().await?;
 
-    let delete_path = "s3://iceberg-test/warehouse/taxi/data/pos-delete.parquet";
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(RESERVED_COL_NAME_DELETE_FILE_PATH, DataType::Utf8, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                RESERVED_FIELD_ID_DELETE_FILE_PATH.to_string(),
-            )])),
-        Field::new(RESERVED_COL_NAME_DELETE_FILE_POS, DataType::Int64, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                RESERVED_FIELD_ID_DELETE_FILE_POS.to_string(),
-            )])),
+    let delete_path = format!("{root}/delete.parquet");
+    let delete_schema = Arc::new(ArrowSchema::new(vec![
+        field(
+            RESERVED_COL_NAME_DELETE_FILE_PATH,
+            DataType::Utf8,
+            RESERVED_FIELD_ID_DELETE_FILE_PATH,
+        ),
+        field(
+            RESERVED_COL_NAME_DELETE_FILE_POS,
+            DataType::Int64,
+            RESERVED_FIELD_ID_DELETE_FILE_POS,
+        ),
     ]));
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        delete_schema,
         vec![
-            Arc::new(StringArray::from(vec![data_file.file_path()])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+            Arc::new(StringArray::from(vec![format!("{root}/data-0.parquet")])),
+            Arc::new(Int64Array::from(vec![0])),
         ],
     )?;
-    let delete_file_on_disk = temporary
-        .path()
-        .join("iceberg/taxi/data/pos-delete.parquet");
-    let mut writer =
-        ArrowWriter::try_new(fs::File::create(&delete_file_on_disk)?, schema, None)?;
-    writer.write(&batch)?;
-    writer.close()?;
-    let delete_size = fs::metadata(&delete_file_on_disk)?.len();
-
-    let next_snapshot_id = snapshot.snapshot_id() + 1;
+    let size = write_parquet(&delete_path, batch)?;
     let mut delete_manifest = ManifestWriterBuilder::new(
-        table
-            .file_io()
-            .new_output("s3://iceberg-test/warehouse/taxi/metadata/pos-delete.avro")?,
-        Some(next_snapshot_id),
-        snapshot.schema(table.metadata())?,
-        table.metadata().default_partition_spec().as_ref().clone(),
+        io.new_output(format!("{root}/deletes.avro"))?,
+        Some(2),
+        schema.clone(),
+        spec,
     )
     .build_v2_deletes();
     delete_manifest.add_file(
         DataFileBuilder::default()
-            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition_spec_id(0)
             .content(DataContentType::PositionDeletes)
-            .file_path(delete_path.to_string())
+            .file_path(delete_path)
             .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(delete_size)
+            .file_size_in_bytes(size)
             .record_count(1)
-            .partition(data_file.partition().clone())
+            .partition(Struct::empty())
             .build()?,
-        -1,
+        2,
     )?;
     let delete_manifest = delete_manifest.write_manifest_file().await?;
-    let manifest_list_path =
-        "s3://iceberg-test/warehouse/taxi/metadata/snap-with-delete.avro";
-    let mut writer = ManifestListWriter::v2(
-        table
-            .file_io()
-            .new_output(manifest_list_path)?
-            .writer()
-            .await?,
-        next_snapshot_id,
-        Some(snapshot.snapshot_id()),
-        snapshot.sequence_number() + 1,
+    let manifest_list_path = format!("{root}/snapshot.avro");
+    let mut list = ManifestListWriter::v2(
+        io.new_output(&manifest_list_path)?.writer().await?,
+        2,
+        None,
+        2,
     );
-    writer.add_manifests(
-        manifest_list
-            .entries()
-            .iter()
-            .cloned()
-            .chain([delete_manifest]),
-    )?;
-    writer.close().await?;
-
-    let new_snapshot = Snapshot::builder()
-        .with_snapshot_id(next_snapshot_id)
-        .with_parent_snapshot_id(Some(snapshot.snapshot_id()))
-        .with_sequence_number(snapshot.sequence_number() + 1)
-        .with_timestamp_ms(snapshot.timestamp_ms() + 1)
+    list.add_manifests([data_manifest, delete_manifest].into_iter())?;
+    list.close().await?;
+    let snapshot = Snapshot::builder()
+        .with_snapshot_id(2)
+        .with_sequence_number(2)
+        .with_timestamp_ms(metadata.last_updated_ms() + 1)
         .with_manifest_list(manifest_list_path)
+        .with_schema_id(schema.schema_id())
         .with_summary(Summary {
-            operation: Operation::Delete,
+            operation: Operation::Overwrite,
             additional_properties: HashMap::new(),
         })
-        .with_schema_id(snapshot.schema(table.metadata())?.schema_id())
         .build();
-    let metadata = table
-        .metadata()
-        .clone()
+    let metadata = metadata
         .into_builder(None)
-        .set_branch_snapshot(new_snapshot, "main")?
+        .set_branch_snapshot(snapshot, "main")?
         .build()?
         .metadata;
     let table = Table::builder()
-        .file_io(table.file_io().clone())
-        .identifier(table.identifier().clone())
+        .file_io(io)
+        .identifier(TableIdent::from_strs(["test", "deletes"])?)
         .metadata(metadata)
         .runtime(Runtime::try_current()?)
         .build()?;
     Ok(PositionDeleteFixture {
         table,
-        _directory: temporary,
+        _directory: directory,
     })
 }
 
-fn copy_fixture(from: &Path, to: &Path) -> io::Result<()> {
-    fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let destination = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_fixture(&entry.path(), &destination)?;
-        } else {
-            fs::copy(entry.path(), destination)?;
-        }
-    }
-    Ok(())
+fn field(name: &str, data_type: DataType, id: i32) -> Field {
+    Field::new(name, data_type, false).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        id.to_string(),
+    )]))
+}
+
+fn write_parquet(path: &str, batch: RecordBatch) -> Result<u64, Box<dyn Error>> {
+    let mut writer = ArrowWriter::try_new(File::create(path)?, batch.schema(), None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(std::fs::metadata(path)?.len())
 }

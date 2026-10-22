@@ -38,12 +38,7 @@ use iceberg::table::Table;
 
 use super::file_planning::PlannedFileScan;
 use super::predicate::convert_filters_to_predicate;
-use crate::{IcebergPlanningConfig, to_datafusion_error};
-
-// A reader is created once per physical scan. Its clones share the delete loader's
-// cache while each read() call still owns its own scan metrics.
-#[derive(Clone)]
-struct ScanReader(ArrowReader);
+use crate::to_datafusion_error;
 
 #[derive(Debug, Clone)]
 struct PlannedScan {
@@ -57,15 +52,9 @@ impl PlannedScan {
     }
 }
 
-impl std::fmt::Debug for ScanReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ScanReader")
-    }
-}
-
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IcebergDataSource {
     /// A table in the catalog.
     table: Table,
@@ -80,7 +69,21 @@ pub struct IcebergDataSource {
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
     planned: Option<PlannedScan>,
-    reader: ScanReader,
+    reader: ArrowReader,
+}
+
+impl std::fmt::Debug for IcebergDataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergDataSource")
+            .field("table", &self.table)
+            .field("snapshot_id", &self.snapshot_id)
+            .field("schema", &self.schema)
+            .field("projection", &self.projection)
+            .field("predicate", &self.predicate)
+            .field("fetch", &self.fetch)
+            .field("planned", &self.planned)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IcebergDataSource {
@@ -95,14 +98,15 @@ impl IcebergDataSource {
             snapshot_id: None,
             predicate: None,
             fetch: None,
+            eager_planning: false,
         }
     }
 
     /// Planned, ungrouped tasks, if file discovery was enabled for this scan.
     /// A distributed consumer may assign these tasks to its own workers instead
     /// of using the local output partitions of this source.
-    pub fn planned_files(&self) -> Option<&PlannedFileScan> {
-        self.planned.as_ref().map(|planned| planned.files.as_ref())
+    pub fn planned_files(&self) -> Option<&[FileScanTask]> {
+        self.planned.as_ref().map(|planned| planned.files.tasks())
     }
 
     /// Retained tasks assigned to a local output partition, in planning order.
@@ -165,8 +169,8 @@ impl IcebergDataSource {
 /// Builds an [`IcebergDataSource`]. Created by [`IcebergDataSource::builder`].
 ///
 /// A table provider passes the table's schema and selects columns with
-/// [`Self::with_projection`]. Finish with [`Self::with_planned_files`] to honor
-/// the session's eager-planning option before building.
+/// [`Self::with_projection`]. Enable [`Self::with_eager_planning`] to select files
+/// during [`Self::build`] instead of execution.
 ///
 /// To rebuild a source, such as in another process,
 /// pass its [`IcebergDataSource::schema`], which is already projected, and no
@@ -180,6 +184,7 @@ pub struct IcebergDataSourceBuilder {
     snapshot_id: Option<i64>,
     predicate: Option<Predicate>,
     fetch: Option<usize>,
+    eager_planning: bool,
 }
 
 impl IcebergDataSourceBuilder {
@@ -216,65 +221,49 @@ impl IcebergDataSourceBuilder {
         self
     }
 
-    /// Finish configuring the scan and optionally select its files before execution.
-    ///
-    /// Honors [`IcebergPlanningConfig::eager_file_planning`]. The returned builder
-    /// only exposes `build`, so filters, projection, and snapshot cannot change
-    /// after files have been selected.
+    /// Select files during [`Self::build`] when enabled. Defaults to `false`.
+    pub fn with_eager_planning(mut self, enabled: bool) -> Self {
+        self.eager_planning = enabled;
+        self
+    }
+
+    /// Builds the source and its shared reader. When eager planning is enabled,
+    /// discovers files using `context` for partition count and memory accounting.
+    /// Lazy builds perform no file-discovery I/O.
     ///
     /// # Errors
     ///
     /// Returns an error if the projection is invalid, file planning fails, or
-    /// the retained tasks exceed the query memory pool.
-    pub async fn with_planned_files(
-        self,
-        context: Arc<TaskContext>,
-    ) -> Result<PlannedIcebergDataSourceBuilder> {
-        if !context
-            .session_config()
-            .options()
-            .extensions
-            .get::<IcebergPlanningConfig>()
-            .is_some_and(|config| config.eager_file_planning)
-        {
-            return Ok(PlannedIcebergDataSourceBuilder {
-                builder: self,
-                planned: None,
-            });
-        }
-        let target_partitions = context.session_config().target_partitions();
-        let schema = self.projected_schema()?;
-        let projection: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        let scan = build_table_scan(
-            &self.table,
-            self.snapshot_id,
-            Some(&projection),
-            self.predicate.as_ref(),
-        )?;
-        // Dropping physical planning drops collection and its memory reservation.
-        let planned = PlannedFileScan::collect(scan, &context).await?;
-        let partitions = planned.tasks().len().max(1).min(target_partitions.max(1));
-
-        Ok(PlannedIcebergDataSourceBuilder {
-            builder: self,
-            planned: Some(PlannedScan {
-                files: Arc::new(planned),
+    /// retained tasks exceed the query memory pool.
+    pub async fn build(self, context: Arc<TaskContext>) -> Result<IcebergDataSource> {
+        let planned = if self.eager_planning {
+            let schema = self.projected_schema()?;
+            let projection: Vec<String> = schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            let scan = build_table_scan(
+                &self.table,
+                self.snapshot_id,
+                Some(&projection),
+                self.predicate.as_ref(),
+            )?;
+            // Dropping physical planning drops collection and its reservation.
+            let files = PlannedFileScan::collect(scan, &context).await?;
+            let partitions = files
+                .tasks()
+                .len()
+                .max(1)
+                .min(context.session_config().target_partitions().max(1));
+            Some(PlannedScan {
+                files: Arc::new(files),
                 partitions,
-            }),
-        })
-    }
-
-    /// Builds the source, which reads the columns of its projected schema by name.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the projection is out of bounds for the schema.
-    pub fn build(self) -> Result<IcebergDataSource> {
-        self.build_with_planned_files(None)
+            })
+        } else {
+            None
+        };
+        self.build_with_planned_files(planned)
     }
 
     fn projected_schema(&self) -> Result<ArrowSchemaRef> {
@@ -303,7 +292,8 @@ impl IcebergDataSourceBuilder {
         } else {
             reader
         };
-        let reader = ScanReader(reader.build());
+        // Reader clones share the delete loader across output partitions.
+        let reader = reader.build();
         Ok(IcebergDataSource {
             table: self.table,
             snapshot_id: self.snapshot_id,
@@ -314,27 +304,6 @@ impl IcebergDataSourceBuilder {
             planned,
             reader,
         })
-    }
-}
-
-/// A configured scan ready to build after optional eager file planning.
-///
-/// Created by [`IcebergDataSourceBuilder::with_planned_files`]. Configuration
-/// is fixed so the retained tasks stay consistent with the resulting source.
-#[derive(Debug, Clone)]
-pub struct PlannedIcebergDataSourceBuilder {
-    builder: IcebergDataSourceBuilder,
-    planned: Option<PlannedScan>,
-}
-
-impl PlannedIcebergDataSourceBuilder {
-    /// Construct the source and its shared reader from the configured scan.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the projection is out of bounds for the schema.
-    pub fn build(self) -> Result<IcebergDataSource> {
-        self.builder.build_with_planned_files(self.planned)
     }
 }
 
@@ -378,7 +347,6 @@ impl DataSource for IcebergDataSource {
         // Reader clones share their delete loader; no per-partition cache is rebuilt.
         let stream = self
             .reader
-            .0
             .clone()
             .read(tasks)
             .map_err(to_datafusion_error)?
@@ -425,12 +393,13 @@ impl DataSource for IcebergDataSource {
             write!(f, ", fetch={fetch}")?;
         }
         if let Some(planned) = self.planned_files() {
-            write!(f, ", planned_files={}", planned.tasks().len())?;
+            write!(f, ", planned_files={}", planned.len())?;
         }
         Ok(())
     }
 
     fn output_partitioning(&self) -> Partitioning {
+        // Partitioned lazy discovery: https://github.com/apache/datafusion-iceberg/issues/84
         Partitioning::UnknownPartitioning(
             self.planned
                 .as_ref()

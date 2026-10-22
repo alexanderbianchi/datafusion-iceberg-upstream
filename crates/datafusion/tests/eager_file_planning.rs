@@ -19,6 +19,7 @@ use std::error::Error;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
+use datafusion::arrow::array::Int64Array;
 use datafusion::common::{Result, stats::Precision};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
@@ -26,7 +27,7 @@ use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::{ExecutionPlanProperties, collect as collect_plan};
-use datafusion::prelude::{SessionConfig, col, lit};
+use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use iceberg_datafusion::read::IcebergDataSource;
 use iceberg_datafusion::test_utils::IcebergTestHarness;
@@ -36,13 +37,13 @@ use iceberg_datafusion::{
 
 mod common;
 
-use common::position_deletes::taxi_with_position_delete;
+use common::position_deletes::table_with_position_delete;
 
 fn eager_config() -> SessionConfig {
     SessionConfig::new()
         .with_target_partitions(4)
         .with_option_extension(IcebergPlanningConfig::default())
-        .set_bool("iceberg_local.eager_file_planning", true)
+        .set_bool("iceberg.eager_file_planning", true)
 }
 
 fn iceberg_source(
@@ -74,7 +75,7 @@ async fn plans_file_tasks_before_execution_without_changing_statistics() -> Resu
     assert!(lazy_source.planned_partition_tasks(0)?.is_none());
     assert!(lazy_source.planned_partition_tasks(1).is_err());
     assert!(eager_source.planned_partition_tasks(4).is_err());
-    let tasks = eager_source.planned_files().unwrap().tasks();
+    let tasks = eager_source.planned_files().unwrap();
     for (partition, indices) in [vec![0, 4], vec![1, 5], vec![2, 6], vec![3]]
         .into_iter()
         .enumerate()
@@ -92,7 +93,7 @@ async fn plans_file_tasks_before_execution_without_changing_statistics() -> Resu
     }
 
     assert_eq!(lazy_plan.output_partitioning().partition_count(), 1);
-    assert_eq!(eager_source.planned_files().unwrap().tasks().len(), 7);
+    assert_eq!(eager_source.planned_files().unwrap().len(), 7);
     assert_eq!(eager_plan.output_partitioning().partition_count(), 4);
     assert!(eager_source.open(4, eager.context().task_ctx()).is_err());
     assert!(lazy_source.open(1, lazy.context().task_ctx()).is_err());
@@ -117,7 +118,6 @@ async fn plans_file_tasks_before_execution_without_changing_statistics() -> Resu
         iceberg_source(empty.as_ref())
             .planned_files()
             .unwrap()
-            .tasks()
             .is_empty()
     );
     assert_eq!(empty.output_partitioning().partition_count(), 1);
@@ -142,30 +142,27 @@ async fn eager_partition_count_is_bounded_by_selected_files() -> Result<()> {
 async fn filtered_and_empty_eager_scans_match_lazy_results() -> Result<()> {
     let eager = IcebergTestHarness::with_config(eager_config()).await?;
     let lazy = IcebergTestHarness::new().await?;
-    for (query, planned_files) in [
+    for (name, query) in [
         (
+            "partition_pruning",
             "SELECT pickup_date, COUNT(*) AS trips FROM taxi \
              WHERE pickup_date = DATE '2024-01-10' \
              GROUP BY pickup_date ORDER BY pickup_date",
-            1,
         ),
         (
+            "residual_filter",
             "SELECT COUNT(*) AS trips FROM taxi \
              WHERE pickup_date = DATE '2024-01-08' AND trip_distance > 50",
-            1,
         ),
         (
+            "empty_scan",
             "SELECT COUNT(*) AS trips FROM taxi \
              WHERE pickup_date = DATE '2025-01-01'",
-            0,
         ),
     ] {
         let (plan, eager_batches) = eager.query(query).await?;
         let (_, lazy_batches) = lazy.query(query).await?;
-        assert!(
-            plan.contains(&format!("planned_files={planned_files}")),
-            "eager scan not visible in plan: {plan}"
-        );
+        insta::assert_snapshot!(name, format!("{plan}\n{eager_batches}"));
         assert_eq!(eager_batches, lazy_batches);
     }
     Ok(())
@@ -174,9 +171,8 @@ async fn filtered_and_empty_eager_scans_match_lazy_results() -> Result<()> {
 #[tokio::test]
 async fn eager_multi_partition_limit_is_global() -> Result<()> {
     let eager = IcebergTestHarness::with_config(eager_config()).await?;
-    let (plan, batches) = eager.query("SELECT pickup_date FROM taxi LIMIT 3").await?;
-    assert!(plan.contains("planned_files=7"), "unexpected plan: {plan}");
-    assert_eq!(batches.matches("2024-01-").count(), 3, "{batches}");
+    let (plan, batches) = eager.query("SELECT 1 AS n FROM taxi LIMIT 3").await?;
+    insta::assert_snapshot!(format!("{plan}\n{batches}"));
     Ok(())
 }
 
@@ -188,48 +184,60 @@ async fn eager_ordered_limit_matches_lazy_results() -> Result<()> {
                ORDER BY pickup_at, vendor_id, pickup_location_id LIMIT 3";
     let (plan, eager_batches) = eager.query(sql).await?;
     let (_, lazy_batches) = lazy.query(sql).await?;
-    assert!(plan.contains("planned_files=7"), "unexpected plan: {plan}");
+    insta::assert_snapshot!(format!("{plan}\n{eager_batches}"));
     assert_eq!(eager_batches, lazy_batches);
     Ok(())
 }
 
 #[tokio::test]
 async fn eager_and_lazy_scans_apply_position_deletes() -> StdResult<(), Box<dyn Error>> {
-    let fixture = taxi_with_position_delete().await?;
-    let eager = IcebergTestHarness::with_config(eager_config()).await?;
+    let fixture = table_with_position_delete().await?;
+    let eager = SessionContext::new_with_config(eager_config());
     let table = fixture.table.clone();
     let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-    let lazy_state = IcebergTestHarness::with_config(SessionConfig::new()).await?;
+    let lazy = SessionContext::new();
 
-    let state = eager.context().state();
+    let state = eager.state();
     let eager_plan = provider.scan(&state, None, &[], None).await?;
+    // Both unpartitioned files receive the delete task; the reader matches its path.
     assert_eq!(
         iceberg_source(eager_plan.as_ref())
             .planned_files()
             .expect("eager plan has files")
-            .tasks()
             .iter()
             .filter(|task| !task.deletes().is_empty())
             .count(),
-        1
+        2
     );
     assert_eq!(
         iceberg_source(eager_plan.as_ref())
             .planned_files()
             .expect("eager plan has files")
-            .tasks()
             .len(),
-        7
+        2
     );
-    let lazy_plan = provider
-        .scan(&lazy_state.context().state(), None, &[], None)
-        .await?;
+    let lazy_plan = provider.scan(&lazy.state(), None, &[], None).await?;
     let eager_batches = collect_plan(eager_plan, state.task_ctx()).await?;
-    let lazy_batches = collect_plan(lazy_plan, lazy_state.context().task_ctx()).await?;
-    let eager_rows: usize = eager_batches.iter().map(|batch| batch.num_rows()).sum();
-    let lazy_rows: usize = lazy_batches.iter().map(|batch| batch.num_rows()).sum();
-    assert_eq!(lazy_rows, 174_999);
-    assert_eq!(eager_rows, lazy_rows);
+    let lazy_batches = collect_plan(lazy_plan, lazy.task_ctx()).await?;
+    let ids = |batches: &[datafusion::arrow::array::RecordBatch]| {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(ids(&eager_batches), vec![1, 2, 3]);
+    assert_eq!(ids(&eager_batches), ids(&lazy_batches));
     Ok(())
 }
 
@@ -260,11 +268,7 @@ fn eager_scan_uses_the_tables_custom_runtime() -> Result<()> {
         let state = harness.context().state();
         let plan = provider.scan(&state, None, &[], None).await?;
         assert_eq!(
-            iceberg_source(plan.as_ref())
-                .planned_files()
-                .unwrap()
-                .tasks()
-                .len(),
+            iceberg_source(plan.as_ref()).planned_files().unwrap().len(),
             7
         );
         let mut rows = 0;
@@ -293,7 +297,10 @@ async fn eager_tasks_respect_the_query_memory_pool() -> Result<()> {
         .await
         .expect_err("file metadata cannot fit in one byte");
     assert!(
-        error.to_string().contains("Iceberg file planning"),
+        matches!(
+            error,
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
         "{error}"
     );
     assert_eq!(runtime.memory_pool.reserved(), 0);
@@ -329,7 +336,7 @@ async fn retained_tasks_follow_plan_and_stream_lifetimes() -> Result<()> {
 
 #[tokio::test]
 async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
-    let harness = IcebergTestHarness::with_config(eager_config()).await?;
+    let harness = IcebergTestHarness::new().await?;
     let provider = harness.context().table_provider("taxi").await?;
     let provider = provider
         .downcast_ref::<IcebergCatalogTableProvider>()
@@ -345,11 +352,11 @@ async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
     let source = IcebergDataSource::builder(table, schema)
         .with_projection(Some(&projection))
         .with_filters(&[col("pickup_date").eq(lit(pickup_date))])
-        .with_planned_files(harness.context().task_ctx())
-        .await?
-        .build()?;
+        .with_eager_planning(true)
+        .build(harness.context().task_ctx())
+        .await?;
     assert_eq!(source.projection(), &["pickup_date"]);
-    assert_eq!(source.planned_files().unwrap().tasks().len(), 1);
+    assert_eq!(source.planned_files().unwrap().len(), 1);
     assert_eq!(source.output_partitioning().partition_count(), 1);
     let batches = collect(source.open(0, harness.context().task_ctx())?).await?;
     assert!(!batches.is_empty());

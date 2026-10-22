@@ -19,8 +19,5 @@ mod file_planning;
 pub(crate) mod predicate;
 pub(crate) mod scan;
 
-pub use file_planning::PlannedFileScan;
 pub use predicate::convert_filters_to_predicate;
-pub use scan::{
-    IcebergDataSource, IcebergDataSourceBuilder, PlannedIcebergDataSourceBuilder,
-};
+pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};

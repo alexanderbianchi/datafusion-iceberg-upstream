@@ -33,14 +33,14 @@ use crate::to_datafusion_error;
 /// this value alive also keeps the query memory reservation for the retained tasks.
 /// This is not a reader and contains no coordinator-local reader state.
 #[derive(Debug)]
-pub struct PlannedFileScan {
+pub(crate) struct PlannedFileScan {
     tasks: Vec<FileScanTask>,
     _reservation: MemoryReservation,
 }
 
 impl PlannedFileScan {
     /// Tasks in Iceberg's planning order. Assign each once per execution.
-    pub fn tasks(&self) -> &[FileScanTask] {
+    pub(crate) fn tasks(&self) -> &[FileScanTask] {
         &self.tasks
     }
 

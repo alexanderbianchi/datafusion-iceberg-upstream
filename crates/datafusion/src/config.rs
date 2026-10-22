@@ -27,6 +27,5 @@ extensions_options! {
 }
 
 impl ConfigExtension for IcebergPlanningConfig {
-    // Distinct from DFD's `iceberg` options so both integrations can share a session.
-    const PREFIX: &'static str = "iceberg_local";
+    const PREFIX: &'static str = "iceberg";
 }
