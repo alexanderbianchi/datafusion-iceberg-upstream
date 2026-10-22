@@ -473,3 +473,37 @@ async fn retained_tasks_follow_plan_and_stream_lifetimes() -> Result<()> {
     assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
+    let harness = IcebergTestHarness::with_config(eager_config()).await?;
+    let provider = harness.context().table_provider("taxi").await?;
+    let provider = provider
+        .downcast_ref::<IcebergCatalogTableProvider>()
+        .unwrap();
+    let table = provider
+        .catalog()
+        .load_table(provider.table_ident())
+        .await
+        .map_err(iceberg_datafusion::to_datafusion_error)?;
+    let schema = provider.schema();
+    let projection = vec![schema.index_of("pickup_date")?];
+    let pickup_date = ScalarValue::Date32(Some(19732)); // 2024-01-10
+    let source = IcebergDataSource::builder(table, schema)
+        .with_projection(Some(&projection))
+        .with_filters(&[col("pickup_date").eq(lit(pickup_date))])
+        .with_planned_files(harness.context().task_ctx())
+        .await?
+        .build()?;
+    assert_eq!(source.projection(), &["pickup_date"]);
+    assert_eq!(source.planned_files().unwrap().tasks().len(), 1);
+    assert_eq!(source.output_partitioning().partition_count(), 1);
+    let batches = collect(source.open(0, harness.context().task_ctx())?).await?;
+    assert!(!batches.is_empty());
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.schema() == source.schema())
+    );
+    Ok(())
+}

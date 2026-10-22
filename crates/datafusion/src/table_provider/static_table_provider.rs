@@ -131,8 +131,9 @@ impl TableProvider for IcebergStaticTableProvider {
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
+            .with_planned_files(state.task_ctx())
+            .await?
             .build()?;
-        let source = source.with_planned_files(state.task_ctx()).await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 

@@ -92,46 +92,6 @@ impl IcebergDataSource {
         }
     }
 
-    /// Plan file tasks during physical planning; read them only at execution.
-    pub(crate) async fn with_planned_files(
-        mut self,
-        context: Arc<TaskContext>,
-    ) -> Result<Self> {
-        if !context
-            .session_config()
-            .options()
-            .extensions
-            .get::<IcebergPlanningConfig>()
-            .is_some_and(|config| config.eager_file_planning)
-        {
-            return Ok(self);
-        }
-        let target_partitions = context.session_config().target_partitions();
-        let scan = build_table_scan(
-            &self.table,
-            self.snapshot_id,
-            Some(&self.projection),
-            self.predicate.as_ref(),
-        )?;
-        // Dropping physical planning drops collection and its memory reservation.
-        let planned = PlannedFileScan::collect(scan, &context).await?;
-        let partitions = planned.tasks().len().max(1).min(target_partitions.max(1));
-
-        if partitions > 1 {
-            self.reader = ScanReader(
-                self.table
-                    .reader_builder()
-                    .with_data_file_concurrency_limit(1)
-                    .build(),
-            );
-        }
-        self.planned = Some(PlannedScan {
-            files: Arc::new(planned),
-            partitions,
-        });
-        Ok(self)
-    }
-
     /// Planned, ungrouped tasks, if file discovery was enabled for this scan.
     /// A distributed consumer may assign these tasks to its own workers instead
     /// of using the local output partitions of this source.
@@ -167,7 +127,10 @@ impl IcebergDataSource {
 /// Builds an [`IcebergDataSource`]. Created by [`IcebergDataSource::builder`].
 ///
 /// A table provider passes the table's schema and selects columns with
-/// [`Self::with_projection`]. To rebuild a source, such as in another process,
+/// [`Self::with_projection`]. Finish with [`Self::with_planned_files`] to honor
+/// the session's eager-planning option before building.
+///
+/// To rebuild a source, such as in another process,
 /// pass its [`IcebergDataSource::schema`], which is already projected, and no
 /// projection. This rebuilds a lazy single-partition source; planned file tasks
 /// must be transferred separately when reconstructing a distributed scan.
@@ -215,22 +178,94 @@ impl IcebergDataSourceBuilder {
         self
     }
 
+    /// Finish configuring the scan and optionally select its files before execution.
+    ///
+    /// Honors [`IcebergPlanningConfig::eager_file_planning`]. The returned builder
+    /// only exposes `build`, so filters, projection, and snapshot cannot change
+    /// after files have been selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection is invalid, file planning fails, or
+    /// the retained tasks exceed the query memory pool.
+    pub async fn with_planned_files(
+        self,
+        context: Arc<TaskContext>,
+    ) -> Result<PlannedIcebergDataSourceBuilder> {
+        if !context
+            .session_config()
+            .options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
+            .is_some_and(|config| config.eager_file_planning)
+        {
+            return Ok(PlannedIcebergDataSourceBuilder {
+                builder: self,
+                planned: None,
+            });
+        }
+        let target_partitions = context.session_config().target_partitions();
+        let schema = self.projected_schema()?;
+        let projection: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let scan = build_table_scan(
+            &self.table,
+            self.snapshot_id,
+            Some(&projection),
+            self.predicate.as_ref(),
+        )?;
+        // Dropping physical planning drops collection and its memory reservation.
+        let planned = PlannedFileScan::collect(scan, &context).await?;
+        let partitions = planned.tasks().len().max(1).min(target_partitions.max(1));
+
+        Ok(PlannedIcebergDataSourceBuilder {
+            builder: self,
+            planned: Some(PlannedScan {
+                files: Arc::new(planned),
+                partitions,
+            }),
+        })
+    }
+
     /// Builds the source, which reads the columns of its projected schema by name.
     ///
     /// # Errors
     ///
     /// Returns an error if the projection is out of bounds for the schema.
     pub fn build(self) -> Result<IcebergDataSource> {
-        let schema = match &self.projection {
-            None => self.schema,
-            Some(projection) => Arc::new(self.schema.project(projection)?),
-        };
+        self.build_with_planned_files(None)
+    }
+
+    fn projected_schema(&self) -> Result<ArrowSchemaRef> {
+        match &self.projection {
+            None => Ok(self.schema.clone()),
+            Some(projection) => Ok(Arc::new(self.schema.project(projection)?)),
+        }
+    }
+
+    fn build_with_planned_files(
+        self,
+        planned: Option<PlannedScan>,
+    ) -> Result<IcebergDataSource> {
+        let schema = self.projected_schema()?;
         let projection = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect();
-        let reader = ScanReader(self.table.reader_builder().build());
+        let reader = self.table.reader_builder();
+        let reader = if planned
+            .as_ref()
+            .is_some_and(|planned| planned.partitions > 1)
+        {
+            reader.with_data_file_concurrency_limit(1)
+        } else {
+            reader
+        };
+        let reader = ScanReader(reader.build());
         Ok(IcebergDataSource {
             table: self.table,
             snapshot_id: self.snapshot_id,
@@ -238,9 +273,30 @@ impl IcebergDataSourceBuilder {
             projection,
             predicate: self.predicate,
             fetch: self.fetch,
-            planned: None,
+            planned,
             reader,
         })
+    }
+}
+
+/// A configured scan ready to build after optional eager file planning.
+///
+/// Created by [`IcebergDataSourceBuilder::with_planned_files`]. Configuration
+/// is fixed so the retained tasks stay consistent with the resulting source.
+#[derive(Debug, Clone)]
+pub struct PlannedIcebergDataSourceBuilder {
+    builder: IcebergDataSourceBuilder,
+    planned: Option<PlannedScan>,
+}
+
+impl PlannedIcebergDataSourceBuilder {
+    /// Construct the source and its shared reader from the configured scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection is out of bounds for the schema.
+    pub fn build(self) -> Result<IcebergDataSource> {
+        self.builder.build_with_planned_files(self.planned)
     }
 }
 
