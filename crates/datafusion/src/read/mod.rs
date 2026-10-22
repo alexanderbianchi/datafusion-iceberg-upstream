@@ -17,10 +17,13 @@
 
 mod file_planning;
 pub(crate) mod predicate;
+mod read_strategy;
 pub(crate) mod scan;
 
 pub use file_planning::PlannedFileScan;
 pub use predicate::convert_filters_to_predicate;
+pub use read_strategy::ReadStrategy;
 pub use scan::{
     IcebergDataSource, IcebergDataSourceBuilder, PlannedIcebergDataSourceBuilder,
+    PlannedScan,
 };

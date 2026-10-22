@@ -15,22 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Statistics, internal_err};
+use datafusion::common::{Statistics, internal_err, plan_err};
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::TryStreamExt;
 use iceberg::arrow::ArrowReader;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream, TableScan};
@@ -38,6 +38,7 @@ use iceberg::table::Table;
 
 use super::file_planning::PlannedFileScan;
 use super::predicate::convert_filters_to_predicate;
+use super::read_strategy::{ReadStrategy, read_ordered};
 use crate::{IcebergPlanningConfig, to_datafusion_error};
 
 // A reader is created once per physical scan. Its clones share the delete loader's
@@ -45,10 +46,13 @@ use crate::{IcebergPlanningConfig, to_datafusion_error};
 #[derive(Clone)]
 struct ScanReader(ArrowReader);
 
+/// Reusable planned tasks, partition assignment, and their validated read strategy.
+/// Keep this value when rebuilding a source whose parent plan relies on its properties.
 #[derive(Debug, Clone)]
-struct PlannedScan {
+pub struct PlannedScan {
     files: Arc<PlannedFileScan>,
     partitions: usize,
+    strategy: ReadStrategy,
 }
 
 impl PlannedScan {
@@ -81,6 +85,7 @@ pub struct IcebergDataSource {
     fetch: Option<usize>,
     planned: Option<PlannedScan>,
     reader: ScanReader,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergDataSource {
@@ -137,6 +142,19 @@ impl IcebergDataSource {
         Ok(())
     }
 
+    /// Retained execution state, including the read strategy and partition assignment.
+    /// Pass a clone to [`IcebergDataSourceBuilder::with_planned_scan`] when rebuilding.
+    pub fn planned_scan(&self) -> Option<&PlannedScan> {
+        self.planned.as_ref()
+    }
+
+    /// The read strategy selected during planning; lazy scans read unordered.
+    pub fn read_strategy(&self) -> &ReadStrategy {
+        self.planned
+            .as_ref()
+            .map_or(&ReadStrategy::Unordered, |p| &p.strategy)
+    }
+
     pub fn table(&self) -> &Table {
         &self.table
     }
@@ -171,7 +189,9 @@ impl IcebergDataSource {
 /// To rebuild a source, such as in another process,
 /// pass its [`IcebergDataSource::schema`], which is already projected, and no
 /// projection. This rebuilds a lazy single-partition source; planned file tasks
-/// must be transferred separately when reconstructing a distributed scan.
+/// must be transferred separately when reconstructing a distributed scan. For a
+/// local rebuild, pass [`IcebergDataSource::planned_scan`] to
+/// [`Self::with_planned_scan`] to preserve partitioning and ordering.
 #[derive(Debug, Clone)]
 pub struct IcebergDataSourceBuilder {
     table: Table,
@@ -218,7 +238,7 @@ impl IcebergDataSourceBuilder {
 
     /// Finish configuring the scan and optionally select its files before execution.
     ///
-    /// Honors [`IcebergPlanningConfig::eager_file_planning`]. The returned builder
+    /// Honors eager file planning and ordering preservation options. The returned builder
     /// only exposes `build`, so filters, projection, and snapshot cannot change
     /// after files have been selected.
     ///
@@ -230,13 +250,14 @@ impl IcebergDataSourceBuilder {
         self,
         context: Arc<TaskContext>,
     ) -> Result<PlannedIcebergDataSourceBuilder> {
-        if !context
+        let config = context
             .session_config()
             .options()
             .extensions
             .get::<IcebergPlanningConfig>()
-            .is_some_and(|config| config.eager_file_planning)
-        {
+            .cloned()
+            .unwrap_or_default();
+        if !config.eager_file_planning && !config.preserve_data_ordering {
             return Ok(PlannedIcebergDataSourceBuilder {
                 builder: self,
                 planned: None,
@@ -259,13 +280,36 @@ impl IcebergDataSourceBuilder {
         let planned = PlannedFileScan::collect(scan, &context).await?;
         let partitions = planned.tasks().len().max(1).min(target_partitions.max(1));
 
+        let strategy = if config.preserve_data_ordering
+            && planned.tasks().len().div_ceil(partitions)
+                <= config.max_merge_files_per_partition
+        {
+            ReadStrategy::for_files(planned.tasks(), &schema)
+        } else {
+            ReadStrategy::Unordered
+        };
+
         Ok(PlannedIcebergDataSourceBuilder {
             builder: self,
             planned: Some(PlannedScan {
                 files: Arc::new(planned),
                 partitions,
+                strategy,
             }),
         })
+    }
+
+    /// Restore the tasks, partition assignment, and strategy of an existing source.
+    /// The snapshot, predicate, and output schema must describe the same scan.
+    /// An optimized parent plan may rely on these partitions and their ordering.
+    pub fn with_planned_scan(
+        self,
+        planned: Option<PlannedScan>,
+    ) -> PlannedIcebergDataSourceBuilder {
+        PlannedIcebergDataSourceBuilder {
+            builder: self,
+            planned,
+        }
     }
 
     /// Builds the source, which reads the columns of its projected schema by name.
@@ -294,15 +338,22 @@ impl IcebergDataSourceBuilder {
             .iter()
             .map(|field| field.name().clone())
             .collect();
-        let reader = self.table.reader_builder();
-        let reader = if planned
-            .as_ref()
-            .is_some_and(|planned| planned.partitions > 1)
+        if let Some(planned) = &planned
+            && planned.strategy.ordering().is_some()
+            && ReadStrategy::for_files(planned.files.tasks(), &schema).ordering()
+                != planned.strategy.ordering()
         {
-            reader.with_data_file_concurrency_limit(1)
-        } else {
-            reader
-        };
+            return plan_err!(
+                "Rebuilt Iceberg scan does not preserve its planned ordering"
+            );
+        }
+        let mut reader = self.table.reader_builder();
+        if let Some(planned) = &planned
+            && planned.partitions > 1
+            && planned.strategy.ordering().is_none()
+        {
+            reader = reader.with_data_file_concurrency_limit(1);
+        }
         let reader = ScanReader(reader.build());
         Ok(IcebergDataSource {
             table: self.table,
@@ -313,6 +364,7 @@ impl IcebergDataSourceBuilder {
             fetch: self.fetch,
             planned,
             reader,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -332,7 +384,8 @@ impl PlannedIcebergDataSourceBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the projection is out of bounds for the schema.
+    /// Returns an error if the projection is out of bounds or restored tasks
+    /// cannot preserve their ordering with the requested schema.
     pub fn build(self) -> Result<IcebergDataSource> {
         self.builder.build_with_planned_files(self.planned)
     }
@@ -349,65 +402,63 @@ impl DataSource for IcebergDataSource {
     fn open(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         self.validate_partition(partition)?;
-        let tasks: FileScanTaskStream = match &self.planned {
-            Some(planned) => {
-                // The reader owns each task; cloning keeps the physical plan reusable.
-                let files = Arc::clone(&planned.files);
-                let tasks = planned
-                    .task_indices(partition)
-                    .map(move |index| Ok(files.tasks()[index].clone()));
-                Box::pin(futures::stream::iter(tasks))
+        let stream = match self.read_strategy() {
+            ReadStrategy::OrderedMerge { ordering } => {
+                let Some(tasks) = self.planned_partition_tasks(partition)? else {
+                    return internal_err!("Ordered Iceberg scan requires planned tasks");
+                };
+                read_ordered(
+                    self.reader.0.clone(),
+                    tasks,
+                    self.schema.clone(),
+                    ordering,
+                    partition,
+                    &context,
+                )?
             }
-            None => {
-                let scan = build_table_scan(
-                    &self.table,
-                    self.snapshot_id,
-                    Some(&self.projection),
-                    self.predicate.as_ref(),
-                )?;
-                Box::pin(
-                    futures::stream::once(async move { scan.plan_files().await })
-                        .try_flatten(),
-                )
+            ReadStrategy::Unordered => {
+                let tasks: FileScanTaskStream = match &self.planned {
+                    Some(planned) => {
+                        // The reader owns each task; cloning keeps the physical plan reusable.
+                        let files = Arc::clone(&planned.files);
+                        let tasks = planned
+                            .task_indices(partition)
+                            .map(move |index| Ok(files.tasks()[index].clone()));
+                        Box::pin(futures::stream::iter(tasks))
+                    }
+                    None => {
+                        let scan = build_table_scan(
+                            &self.table,
+                            self.snapshot_id,
+                            Some(&self.projection),
+                            self.predicate.as_ref(),
+                        )?;
+                        Box::pin(
+                            futures::stream::once(async move { scan.plan_files().await })
+                                .try_flatten(),
+                        )
+                    }
+                };
+                let stream = self
+                    .reader
+                    .0
+                    .clone()
+                    .read(tasks)
+                    .map_err(to_datafusion_error)?
+                    .stream()
+                    .map_err(to_datafusion_error);
+                Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
+                    as SendableRecordBatchStream
             }
         };
-        // Both modes consume a file-task stream through the same reader implementation.
-        // Reader clones share their delete loader; no per-partition cache is rebuilt.
-        let stream = self
-            .reader
-            .0
-            .clone()
-            .read(tasks)
-            .map_err(to_datafusion_error)?
-            .stream()
-            .map_err(to_datafusion_error);
-
-        // Apply the fetch if specified.
-        let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            if let Some(limit) = self.fetch {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
-            limited_stream,
+        Ok(Box::pin(LimitStream::new(
+            stream,
+            0,
+            self.fetch,
+            BaselineMetrics::new(&self.metrics, partition),
         )))
     }
 
@@ -427,6 +478,9 @@ impl DataSource for IcebergDataSource {
         if let Some(planned) = self.planned_files() {
             write!(f, ", planned_files={}", planned.tasks().len())?;
         }
+        if let Some(ordering) = self.read_strategy().ordering() {
+            write!(f, ", output_ordering=[{ordering}]")?;
+        }
         Ok(())
     }
 
@@ -439,11 +493,18 @@ impl DataSource for IcebergDataSource {
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
-        EquivalenceProperties::new(self.schema.clone())
+        EquivalenceProperties::new_with_orderings(
+            self.schema.clone(),
+            self.read_strategy().ordering().cloned(),
+        )
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+    }
+
+    fn metrics(&self) -> ExecutionPlanMetricsSet {
+        self.metrics.clone()
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
