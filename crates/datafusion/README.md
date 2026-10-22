@@ -33,12 +33,13 @@ use iceberg_datafusion::IcebergPlanningConfig;
 
 let config = SessionConfig::new()
     .with_option_extension(IcebergPlanningConfig::default())
-    .set_bool("iceberg_local.plan_files", true);
+    .set_bool("iceberg_local.eager_file_planning", true);
 ```
 
 The option defaults to `false`. When enabled, each physical scan retains its
-selected tasks within the query's memory pool, failing rather than truncating
-if more than `iceberg_local.planning_max_files` (default: 100,000) are selected.
+selected tasks with an estimated reservation in the query's memory pool. There
+is no file-count cap: exceeding the memory pool returns an error, never a
+partial file list.
 Tasks are assigned round-robin to at most the session's `target_partitions`;
 an empty scan exposes one empty partition. This does **not** read Parquet data
 during planning. The physical scan continues to report unknown statistics.
@@ -60,8 +61,22 @@ and apply them to a locally constructed builder in iceberg-rust, with
 construct readers using worker-local IO and runtimes rather than transport a
 builder or reader.
 
+Both modes feed tasks to the same reader implementation. One reader is built
+per physical scan, and its clones share the delete loader across output
+partitions. Dropping eager planning drops collection and its memory reservation.
+
+`TableScan::plan_files()` performs its initial manifest-list read on the calling
+runtime before spawning manifest work on the table's runtime. The planning
+caller must therefore support metadata I/O, even with a separately configured
+table runtime. The table's runtime accessor is private; making `plan_files()`
+offload that initial read is an upstream follow-up.
+
 Planning the whole file list earlier adds metadata I/O and retained-task memory
 even when a query stops early (for example, `LIMIT`), and equivalent provider
 `scan()` calls currently repeat planning. No performance improvement is claimed
-by this option alone. Delete-bearing eager scans and cross-partition delete-cache
-reuse also need dedicated validation before enabling it by default.
+by this option alone. A position-delete fixture verifies eager/lazy row counts;
+equality deletes and cross-partition delete-cache reuse still need dedicated
+validation before enabling it by default.
+
+See [the planning API discussion](eager-planning.md) for the relationship to
+distributed planning and the proposed upstream metadata and reader-settings APIs.

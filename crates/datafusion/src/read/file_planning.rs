@@ -18,9 +18,8 @@
 //! Query-local file work selected before execution, independently of task assignment.
 
 use std::mem::{size_of, size_of_val};
-use std::sync::Arc;
 
-use datafusion::common::{Result, exec_err};
+use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::TryStreamExt;
@@ -35,21 +34,17 @@ use crate::to_datafusion_error;
 /// This is not a reader and contains no coordinator-local reader state.
 #[derive(Debug)]
 pub struct PlannedFileScan {
-    tasks: Vec<Arc<FileScanTask>>,
+    tasks: Vec<FileScanTask>,
     _reservation: MemoryReservation,
 }
 
 impl PlannedFileScan {
-    /// Tasks in Iceberg's planning order. Each must be assigned exactly once by a consumer.
-    pub fn tasks(&self) -> &[Arc<FileScanTask>] {
+    /// Tasks in Iceberg's planning order. Assign each once per execution.
+    pub fn tasks(&self) -> &[FileScanTask] {
         &self.tasks
     }
 
-    pub(crate) async fn collect(
-        scan: TableScan,
-        context: &TaskContext,
-        max_files: usize,
-    ) -> Result<Self> {
+    pub(crate) async fn collect(scan: TableScan, context: &TaskContext) -> Result<Self> {
         let reservation =
             MemoryConsumer::new("Iceberg file planning").register(context.memory_pool());
         let mut planned = Self {
@@ -58,17 +53,12 @@ impl PlannedFileScan {
         };
         let mut stream = scan.plan_files().await.map_err(to_datafusion_error)?;
         while let Some(task) = stream.try_next().await.map_err(to_datafusion_error)? {
-            if planned.tasks.len() >= max_files {
-                return exec_err!(
-                    "Iceberg file planning exceeded planning_max_files={max_files}"
-                );
-            }
             // Allow for spare Vec capacity and allocator overhead; schemas and specs
             // are shared Arcs, but paths and delete references are owned by each task.
             planned
                 ._reservation
                 .try_grow(retained_size(&task).saturating_mul(2))?;
-            planned.tasks.push(Arc::new(task));
+            planned.tasks.push(task);
         }
         Ok(planned)
     }
@@ -76,22 +66,16 @@ impl PlannedFileScan {
 
 fn retained_size(task: &FileScanTask) -> usize {
     let mut bytes = size_of::<FileScanTask>()
-        + size_of::<Arc<FileScanTask>>()
         + task.data_file_path().len()
         + size_of_val(task.project_field_ids())
         + size_of_val(task.deletes())
         + task.key_metadata().map_or(0, <[u8]>::len);
     for delete in task.deletes() {
         bytes = bytes
-            .saturating_add(delete.file_path.len())
-            .saturating_add(delete.referenced_data_file.as_ref().map_or(0, String::len))
-            .saturating_add(
-                delete
-                    .equality_ids
-                    .as_ref()
-                    .map_or(0, |ids| size_of_val(ids.as_slice())),
-            )
-            .saturating_add(delete.key_metadata.as_ref().map_or(0, |key| key.len()));
+            .saturating_add(delete.file_path().len())
+            .saturating_add(delete.referenced_data_file().map_or(0, str::len))
+            .saturating_add(delete.equality_ids().map_or(0, size_of_val))
+            .saturating_add(delete.key_metadata().map_or(0, <[u8]>::len));
     }
     bytes
 }

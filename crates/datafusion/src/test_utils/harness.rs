@@ -26,7 +26,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -58,20 +58,30 @@ impl IcebergTestHarness {
     }
 
     pub async fn with_config(config: SessionConfig) -> Result<Self> {
-        Self::build(config, None).await
+        Self::build(config, None, None).await
+    }
+
+    /// Load the fixture from a separate directory so a test can write metadata safely.
+    pub async fn with_fixture_root(config: SessionConfig, root: PathBuf) -> Result<Self> {
+        Self::build(config, None, Some(root)).await
     }
 
     pub async fn with_config_and_runtime(
         config: SessionConfig,
         runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        Self::build(config, Some(runtime_env)).await
+        Self::build(config, Some(runtime_env), None).await
     }
 
     async fn build(
         config: SessionConfig,
         runtime_env: Option<Arc<RuntimeEnv>>,
+        root: Option<PathBuf>,
     ) -> Result<Self> {
+        let storage_factory: Arc<dyn StorageFactory> = Arc::new(match root {
+            Some(root) => FixtureStorageFactory { root },
+            None => FixtureStorageFactory::default(),
+        });
         let builder = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config);
@@ -85,13 +95,13 @@ impl IcebergTestHarness {
             .with_table_factory(
                 "ICEBERG".to_string(),
                 Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
-                    Arc::new(FixtureStorageFactory::default()),
+                    storage_factory.clone(),
                 )),
             )
             .build();
 
         let catalog = MemoryCatalogBuilder::default()
-            .with_storage_factory(Arc::new(FixtureStorageFactory::default()))
+            .with_storage_factory(storage_factory)
             .load(
                 CATALOG_NAME,
                 HashMap::from([(
@@ -129,12 +139,10 @@ impl IcebergTestHarness {
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
         let dataframe: DataFrame = self.ctx.sql(sql).await?;
         let plan = dataframe.create_physical_plan().await?;
-        let batches = dataframe.collect().await?;
+        let plan_display = displayable(plan.as_ref()).indent(true).to_string();
+        let batches = collect(plan, Arc::new(dataframe.task_ctx())).await?;
 
-        Ok((
-            displayable(plan.as_ref()).indent(true).to_string(),
-            pretty_format_batches(&batches)?.to_string(),
-        ))
+        Ok((plan_display, pretty_format_batches(&batches)?.to_string()))
     }
 }
 

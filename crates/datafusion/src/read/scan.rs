@@ -33,17 +33,23 @@ use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReader;
 use iceberg::expr::Predicate;
-use iceberg::scan::TableScan;
+use iceberg::scan::{FileScanTaskStream, TableScan};
 use iceberg::table::Table;
 
 use super::file_planning::PlannedFileScan;
 use super::predicate::convert_filters_to_predicate;
-use crate::to_datafusion_error;
+use crate::{IcebergPlanningConfig, to_datafusion_error};
 
-// A reader is created once per eager scan. Its clones share the delete loader's
+// A reader is created once per physical scan. Its clones share the delete loader's
 // cache while each read() call still owns its own scan metrics.
 #[derive(Clone)]
 struct ScanReader(ArrowReader);
+
+#[derive(Debug, Clone)]
+struct PlannedScan {
+    files: Arc<PlannedFileScan>,
+    partitions: usize,
+}
 
 impl std::fmt::Debug for ScanReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -67,9 +73,8 @@ pub struct IcebergDataSource {
     predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
-    planned_files: Option<Arc<PlannedFileScan>>,
-    output_partitions: usize,
-    reader: Option<Arc<ScanReader>>,
+    planned: Option<PlannedScan>,
+    reader: ScanReader,
 }
 
 impl IcebergDataSource {
@@ -91,39 +96,47 @@ impl IcebergDataSource {
     pub(crate) async fn with_planned_files(
         mut self,
         context: Arc<TaskContext>,
-        max_files: usize,
-        target_partitions: usize,
     ) -> Result<Self> {
+        if !context
+            .session_config()
+            .options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
+            .is_some_and(|config| config.eager_file_planning)
+        {
+            return Ok(self);
+        }
+        let target_partitions = context.session_config().target_partitions();
         let scan = build_table_scan(
             &self.table,
             self.snapshot_id,
             Some(&self.projection),
             self.predicate.as_ref(),
         )?;
-        let planned = PlannedFileScan::collect(scan, &context, max_files).await?;
+        // Dropping physical planning drops collection and its memory reservation.
+        let planned = PlannedFileScan::collect(scan, &context).await?;
         let partitions = planned.tasks().len().max(1).min(target_partitions.max(1));
 
-        // Table::reader_builder retains the table's FileIO and custom runtime.
-        // This scan currently changes only snapshot, projection, and predicate;
-        // those values are already carried by FileScanTask. A future scan-specific
-        // reader setting must be applied here and in TableScan::to_arrow().
-        let builder = self.table.reader_builder();
-        let builder = if partitions > 1 {
-            builder.with_data_file_concurrency_limit(1)
-        } else {
-            builder
-        };
-        self.reader = Some(Arc::new(ScanReader(builder.build())));
-        self.output_partitions = partitions;
-        self.planned_files = Some(Arc::new(planned));
+        if partitions > 1 {
+            self.reader = ScanReader(
+                self.table
+                    .reader_builder()
+                    .with_data_file_concurrency_limit(1)
+                    .build(),
+            );
+        }
+        self.planned = Some(PlannedScan {
+            files: Arc::new(planned),
+            partitions,
+        });
         Ok(self)
     }
 
     /// Planned, ungrouped tasks, if file discovery was enabled for this scan.
     /// A distributed consumer may assign these tasks to its own workers instead
     /// of using the local output partitions of this source.
-    pub fn planned_files(&self) -> Option<&Arc<PlannedFileScan>> {
-        self.planned_files.as_ref()
+    pub fn planned_files(&self) -> Option<&PlannedFileScan> {
+        self.planned.as_ref().map(|planned| planned.files.as_ref())
     }
 
     pub fn table(&self) -> &Table {
@@ -217,6 +230,7 @@ impl IcebergDataSourceBuilder {
             .iter()
             .map(|field| field.name().clone())
             .collect();
+        let reader = ScanReader(self.table.reader_builder().build());
         Ok(IcebergDataSource {
             table: self.table,
             snapshot_id: self.snapshot_id,
@@ -224,9 +238,8 @@ impl IcebergDataSourceBuilder {
             projection,
             predicate: self.predicate,
             fetch: self.fetch,
-            planned_files: None,
-            output_partitions: 1,
-            reader: None,
+            planned: None,
+            reader,
         })
     }
 }
@@ -244,42 +257,47 @@ impl DataSource for IcebergDataSource {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            if let Some(planned) = &self.planned_files {
-                if partition >= self.output_partitions {
-                    return internal_err!(
-                        "Iceberg scan partition {partition} does not exist"
-                    );
-                }
-                let Some(reader) = &self.reader else {
-                    return internal_err!("Planned Iceberg scan has no reader");
-                };
-                let planned = Arc::clone(planned);
-                let partitions = self.output_partitions;
-                let tasks = futures::stream::iter(
-                    (partition..planned.tasks().len()).step_by(partitions),
-                )
-                .map(move |index| {
-                    Ok(Arc::unwrap_or_clone(Arc::clone(&planned.tasks()[index])))
-                });
+        let partitions = self
+            .planned
+            .as_ref()
+            .map_or(1, |planned| planned.partitions);
+        if partition >= partitions {
+            return internal_err!("Iceberg scan partition {partition} does not exist");
+        }
+        let tasks: FileScanTaskStream = match &self.planned {
+            Some(planned) => {
+                // The reader owns each task; cloning keeps the physical plan reusable.
+                let files = Arc::clone(&planned.files);
                 Box::pin(
-                    reader
-                        .0
-                        .clone()
-                        .read(Box::pin(tasks))
-                        .map_err(to_datafusion_error)?
-                        .stream()
-                        .map_err(to_datafusion_error),
+                    futures::stream::iter(
+                        (partition..files.tasks().len()).step_by(partitions),
+                    )
+                    .map(move |index| Ok(files.tasks()[index].clone())),
                 )
-            } else {
-                let fut = get_batch_stream(
-                    self.table.clone(),
+            }
+            None => {
+                let scan = build_table_scan(
+                    &self.table,
                     self.snapshot_id,
-                    Some(self.projection.clone()),
-                    self.predicate.clone(),
-                );
-                Box::pin(futures::stream::once(fut).try_flatten())
-            };
+                    Some(&self.projection),
+                    self.predicate.as_ref(),
+                )?;
+                Box::pin(
+                    futures::stream::once(async move { scan.plan_files().await })
+                        .try_flatten(),
+                )
+            }
+        };
+        // Both modes consume a file-task stream through the same reader implementation.
+        // Reader clones share their delete loader; no per-partition cache is rebuilt.
+        let stream = self
+            .reader
+            .0
+            .clone()
+            .read(tasks)
+            .map_err(to_datafusion_error)?
+            .stream()
+            .map_err(to_datafusion_error);
 
         // Apply the fetch if specified.
         let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
@@ -320,14 +338,18 @@ impl DataSource for IcebergDataSource {
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
         }
-        if let Some(planned) = &self.planned_files {
+        if let Some(planned) = self.planned_files() {
             write!(f, ", planned_files={}", planned.tasks().len())?;
         }
         Ok(())
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.output_partitions)
+        Partitioning::UnknownPartitioning(
+            self.planned
+                .as_ref()
+                .map_or(1, |planned| planned.partitions),
+        )
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
@@ -354,32 +376,6 @@ impl DataSource for IcebergDataSource {
     ) -> Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
     }
-}
-
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
-    table: Table,
-    snapshot_id: Option<i64>,
-    column_names: Option<Vec<String>>,
-    predicate: Option<Predicate>,
-) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
-    let table_scan = build_table_scan(
-        &table,
-        snapshot_id,
-        column_names.as_deref(),
-        predicate.as_ref(),
-    )?;
-
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
 }
 
 fn build_table_scan(

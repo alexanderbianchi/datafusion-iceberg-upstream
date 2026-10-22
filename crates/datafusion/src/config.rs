@@ -22,9 +22,7 @@ extensions_options! {
     /// Opt-in file planning during physical planning for local Iceberg scans.
     pub struct IcebergPlanningConfig {
         /// Discover and retain file tasks in TableProvider::scan instead of at execution.
-        pub plan_files: bool, default = false
-        /// Fail rather than retain more than this many tasks in a single scan.
-        pub planning_max_files: usize, default = 100_000
+        pub eager_file_planning: bool, default = false
     }
 }
 
