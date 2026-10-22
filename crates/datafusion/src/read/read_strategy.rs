@@ -67,56 +67,32 @@ impl ReadStrategy {
             Self::OrderedMerge { ordering } => Some(ordering),
         }
     }
+}
 
-    pub(crate) fn read(
-        &self,
-        reader: ArrowReader,
-        tasks: FileScanTaskStream,
-        schema: SchemaRef,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        match self {
-            Self::Unordered => read_files(reader, tasks, schema),
-            Self::OrderedMerge { ordering } => {
-                let ordering = ordering.clone();
-                // The outer limit stream records source output, including early stops.
-                let metrics = ExecutionPlanMetricsSet::new();
-                let output_schema = schema.clone();
-                let stream = futures::stream::once(async move {
-                    let streams = tasks
-                        .map(|task| {
-                            read_file(
-                                reader.clone(),
-                                task.map_err(to_datafusion_error)?,
-                                schema.clone(),
-                            )
-                        })
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    let reservation = MemoryConsumer::new(format!(
-                        "Iceberg ordered merge[{partition}]"
-                    ))
-                    .register(context.memory_pool());
-                    StreamingMergeBuilder::new()
-                        .with_streams(
-                            streams.into_iter().map(|s| spawn_buffered(s, 1)).collect(),
-                        )
-                        .with_schema(schema)
-                        .with_expressions(&ordering)
-                        .with_metrics(BaselineMetrics::new(&metrics, partition))
-                        .with_batch_size(context.session_config().batch_size())
-                        .with_reservation(reservation)
-                        .build()
-                })
-                .try_flatten();
-                Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    output_schema,
-                    stream,
-                )))
-            }
-        }
-    }
+/// Construct a merge from retained tasks without adapting them into an async stream.
+pub(crate) fn read_ordered<'a>(
+    reader: ArrowReader,
+    tasks: impl Iterator<Item = &'a FileScanTask>,
+    schema: SchemaRef,
+    ordering: &LexOrdering,
+    partition: usize,
+    context: &TaskContext,
+) -> Result<SendableRecordBatchStream> {
+    let streams = tasks
+        .map(|task| read_file(reader.clone(), task.clone(), schema.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let reservation = MemoryConsumer::new(format!("Iceberg ordered merge[{partition}]"))
+        .register(context.memory_pool());
+    // The outer limit stream records source output, including early stops.
+    let metrics = ExecutionPlanMetricsSet::new();
+    StreamingMergeBuilder::new()
+        .with_streams(streams.into_iter().map(|s| spawn_buffered(s, 1)).collect())
+        .with_schema(schema)
+        .with_expressions(ordering)
+        .with_metrics(BaselineMetrics::new(&metrics, partition))
+        .with_batch_size(context.session_config().batch_size())
+        .with_reservation(reservation)
+        .build()
 }
 
 fn read_file(
@@ -127,7 +103,7 @@ fn read_file(
     read_files(reader, futures::stream::iter([Ok(task)]).boxed(), schema)
 }
 
-fn read_files(
+pub(crate) fn read_files(
     reader: ArrowReader,
     tasks: FileScanTaskStream,
     schema: SchemaRef,

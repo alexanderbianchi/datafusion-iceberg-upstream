@@ -59,8 +59,14 @@ async fn merges_only_assigned_files_and_survives_reconstruction() -> Result<()> 
         .with_fetch(source.fetch())
         .with_planned_scan(source.planned_scan().cloned())
         .build()?;
+    assert!(source.planned_partition_tasks(2).is_err());
+    assert!(source.open(2, harness.context().task_ctx()).is_err());
     let mut all = Vec::new();
     for partition in 0..2 {
+        assert_eq!(
+            source.planned_partition_tasks(partition)?.unwrap().count(),
+            2
+        );
         let batches =
             collect(source.open(partition, harness.context().task_ctx())?).await?;
         assert!(batches.len() > 1);
@@ -271,8 +277,9 @@ async fn single_file_empty_and_stale_schema_are_safe() -> Result<()> {
     // A non-null declaration for nullable snapshot data must not claim NULL ordering.
     let stale = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let source = IcebergDataSource::builder(table, stale)
-        .build_with_context(state.task_ctx())
-        .await?;
+        .with_planned_files(state.task_ctx())
+        .await?
+        .build()?;
     assert!(source.read_strategy().ordering().is_none());
 
     let dir = TempDir::new()?;

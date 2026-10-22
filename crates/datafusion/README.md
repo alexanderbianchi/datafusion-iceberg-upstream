@@ -66,7 +66,9 @@ This implies eager planning even when `eager_file_planning` is false.
 
 The same `IcebergDataSource` assigns files to output partitions before choosing
 how to read them. `ReadStrategy::OrderedMerge` merges the files assigned to each
-partition and advertises that partition's ordering to DataFusion. A global
+partition and advertises that partition's ordering to DataFusion. It constructs
+reader handles synchronously from `planned_partition_tasks()`; file contents
+are still read asynchronously when the merge stream is polled. A global
 `ORDER BY` across partitions can still require a sort-preserving merge.
 The strategy accepts only a compatible leading sequence of projected identity
 sort fields, with matching types and safe nullability. Unsupported or missing
@@ -78,7 +80,7 @@ same eager plan and read unordered. Ordered reads currently merge even when
 no parent operator needs that ordering. File bounds and overlap analysis are
 not part of this implementation.
 
-Custom integrations can use `build_with_context` for the same planning path
+Custom integrations can use `with_planned_files(...).await?.build()` for the same planning path
 as the table providers. For in-process reconstruction, retain `planned_scan()`
 and pass it to `with_planned_scan`: an optimized parent may depend on both
 partitioning and ordering. This is not a distributed serialization API;
