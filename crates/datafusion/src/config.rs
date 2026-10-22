@@ -23,6 +23,12 @@ extensions_options! {
     pub struct IcebergPlanningConfig {
         /// Discover and retain file tasks in TableProvider::scan instead of at execution.
         pub eager_file_planning: bool, default = false
+        /// Plan files eagerly and merge each partition when their sort orders are compatible.
+        /// Merging is performed even if no parent operator needs the order.
+        pub preserve_data_ordering: bool, default = false
+        /// Maximum simultaneously merged files in one partition; not a planning-file cap.
+        /// Larger groups retain their planned files but read without an ordering guarantee.
+        pub max_merge_files_per_partition: usize, default = 64
     }
 }
 

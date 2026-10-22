@@ -57,3 +57,29 @@ that runtime, even when the table has a separate I/O runtime.
 
 The `iceberg_local` prefix allows these options to coexist with DataFusion
 Distributed's `iceberg` options.
+
+## Optional ordered reads
+
+Set `iceberg_local.preserve_data_ordering = true` on the same configuration
+extension to select files eagerly and preserve compatible file ordering.
+This implies eager planning even when `eager_file_planning` is false.
+
+The same `IcebergDataSource` assigns files to output partitions before choosing
+how to read them. `ReadStrategy::OrderedMerge` merges the files assigned to each
+partition and advertises that partition's ordering to DataFusion. A global
+`ORDER BY` across partitions can still require a sort-preserving merge.
+The strategy accepts only a compatible leading sequence of projected identity
+sort fields, with matching types and safe nullability. Unsupported or missing
+orders fall back to unordered reading of the already-planned tasks.
+
+`iceberg_local.max_merge_files_per_partition` defaults to 64. It bounds
+simultaneously merged files, not metadata discovery; larger groups retain the
+same eager plan and read unordered. Ordered reads currently merge even when
+no parent operator needs that ordering. File bounds and overlap analysis are
+not part of this implementation.
+
+Custom integrations can use `build_with_context` for the same planning path
+as the table providers. For in-process reconstruction, retain `planned_scan()`
+and pass it to `with_planned_scan`: an optimized parent may depend on both
+partitioning and ordering. This is not a distributed serialization API;
+transporting tasks and restoring their properties on workers remains separate.

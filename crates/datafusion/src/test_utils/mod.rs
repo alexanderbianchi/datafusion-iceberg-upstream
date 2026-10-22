@@ -16,5 +16,6 @@
 // under the License.
 
 mod harness;
+mod sorted_files;
 
 pub use harness::*;
