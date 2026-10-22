@@ -71,6 +71,26 @@ async fn plans_file_tasks_before_execution_without_changing_statistics() -> Resu
     let lazy_source = iceberg_source(lazy_plan.as_ref());
 
     assert!(lazy_source.planned_files().is_none());
+    assert!(lazy_source.planned_partition_tasks(0)?.is_none());
+    assert!(lazy_source.planned_partition_tasks(1).is_err());
+    assert!(eager_source.planned_partition_tasks(4).is_err());
+    let tasks = eager_source.planned_files().unwrap().tasks();
+    for (partition, indices) in [vec![0, 4], vec![1, 5], vec![2, 6], vec![3]]
+        .into_iter()
+        .enumerate()
+    {
+        let assigned: Vec<_> = eager_source
+            .planned_partition_tasks(partition)?
+            .unwrap()
+            .map(std::ptr::from_ref)
+            .collect();
+        let expected: Vec<_> = indices
+            .into_iter()
+            .map(|index| std::ptr::from_ref(&tasks[index]))
+            .collect();
+        assert_eq!(assigned, expected);
+    }
+
     assert_eq!(lazy_plan.output_partitioning().partition_count(), 1);
     assert_eq!(eager_source.planned_files().unwrap().tasks().len(), 7);
     assert_eq!(eager_plan.output_partitioning().partition_count(), 4);

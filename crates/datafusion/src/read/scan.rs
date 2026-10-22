@@ -30,10 +30,10 @@ use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use iceberg::arrow::ArrowReader;
 use iceberg::expr::Predicate;
-use iceberg::scan::{FileScanTaskStream, TableScan};
+use iceberg::scan::{FileScanTask, FileScanTaskStream, TableScan};
 use iceberg::table::Table;
 
 use super::file_planning::PlannedFileScan;
@@ -49,6 +49,12 @@ struct ScanReader(ArrowReader);
 struct PlannedScan {
     files: Arc<PlannedFileScan>,
     partitions: usize,
+}
+
+impl PlannedScan {
+    fn task_indices(&self, partition: usize) -> impl Iterator<Item = usize> + use<> {
+        (partition..self.files.tasks().len()).step_by(self.partitions)
+    }
 }
 
 impl std::fmt::Debug for ScanReader {
@@ -97,6 +103,38 @@ impl IcebergDataSource {
     /// of using the local output partitions of this source.
     pub fn planned_files(&self) -> Option<&PlannedFileScan> {
         self.planned.as_ref().map(|planned| planned.files.as_ref())
+    }
+
+    /// Retained tasks assigned to a local output partition, in planning order.
+    /// Returns `None` for lazy scans, whose tasks are discovered during execution.
+    ///
+    /// This performs no I/O and does not clone tasks. Readers that outlive this
+    /// source must retain a source clone to keep the planning memory reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `partition` is outside this source's output partitions.
+    pub fn planned_partition_tasks(
+        &self,
+        partition: usize,
+    ) -> Result<Option<impl Iterator<Item = &FileScanTask>>> {
+        self.validate_partition(partition)?;
+        Ok(self.planned.as_ref().map(|planned| {
+            planned
+                .task_indices(partition)
+                .map(|index| &planned.files.tasks()[index])
+        }))
+    }
+
+    fn validate_partition(&self, partition: usize) -> Result<()> {
+        let partitions = self
+            .planned
+            .as_ref()
+            .map_or(1, |planned| planned.partitions);
+        if partition >= partitions {
+            return internal_err!("Iceberg scan partition {partition} does not exist");
+        }
+        Ok(())
     }
 
     pub fn table(&self) -> &Table {
@@ -313,23 +351,15 @@ impl DataSource for IcebergDataSource {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let partitions = self
-            .planned
-            .as_ref()
-            .map_or(1, |planned| planned.partitions);
-        if partition >= partitions {
-            return internal_err!("Iceberg scan partition {partition} does not exist");
-        }
+        self.validate_partition(partition)?;
         let tasks: FileScanTaskStream = match &self.planned {
             Some(planned) => {
                 // The reader owns each task; cloning keeps the physical plan reusable.
                 let files = Arc::clone(&planned.files);
-                Box::pin(
-                    futures::stream::iter(
-                        (partition..files.tasks().len()).step_by(partitions),
-                    )
-                    .map(move |index| Ok(files.tasks()[index].clone())),
-                )
+                let tasks = planned
+                    .task_indices(partition)
+                    .map(move |index| Ok(files.tasks()[index].clone()));
+                Box::pin(futures::stream::iter(tasks))
             }
             None => {
                 let scan = build_table_scan(
