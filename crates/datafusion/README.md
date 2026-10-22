@@ -36,47 +36,24 @@ let config = SessionConfig::new()
     .set_bool("iceberg_local.eager_file_planning", true);
 ```
 
-The option defaults to `false`. When enabled, each physical scan retains its
-selected tasks with an estimated reservation in the query's memory pool. There
-is no file-count cap: exceeding the memory pool returns an error, never a
-partial file list.
-Tasks are assigned round-robin to at most the session's `target_partitions`;
-an empty scan exposes one empty partition. This does **not** read Parquet data
-during planning. The physical scan continues to report unknown statistics.
-`iceberg_local` is distinct from DataFusion Distributed's `iceberg` options so
-both can be registered in the same session.
+### Behavior
 
-The local reader is constructed with the existing public
-`Table::reader_builder()` API, which uses the table's `FileIO` and runtime.
-This matches the current integration's reader defaults because it does not
-set reader options on `TableScan`: the snapshot, projection, and predicate are
-carried by the tasks. For multiple output partitions, each partition reads one
-file at a time instead of using the lazy scan's per-reader file concurrency.
-**Reader settings are not transferred separately from the scan.**
-If scan-specific batch size, data-file concurrency, row-group, row-selection,
-or bloom-filter settings are introduced later, the lazy and planned readers
-could diverge. A follow-up should expose portable scan-level reader options
-and apply them to a locally constructed builder in iceberg-rust, with
-`TableScan::to_arrow()` using the same mapping. Distributed consumers should
-construct readers using worker-local IO and runtimes rather than transport a
-builder or reader.
+- Lazy planning is the default. Eager planning selects files before execution;
+  it reads metadata, not Parquet data.
+- Selected tasks are assigned round-robin to at most `target_partitions`.
+  An empty scan has one empty partition. Each eager partition reads one file
+  at a time when there are multiple output partitions.
+- Retained tasks have an estimated reservation in the query memory pool.
+  Exceeding the pool fails planning; there is no file-count cap or truncation.
+- Both modes use the same reader implementation. Reader clones share the
+  delete loader across partitions. Scan statistics remain unknown.
 
-Both modes feed tasks to the same reader implementation. One reader is built
-per physical scan, and its clones share the delete loader across output
-partitions. Dropping eager planning drops collection and its memory reservation.
+### Trade-offs
 
-`TableScan::plan_files()` performs its initial manifest-list read on the calling
-runtime before spawning manifest work on the table's runtime. The planning
-caller must therefore support metadata I/O, even with a separately configured
-table runtime. The table's runtime accessor is private; making `plan_files()`
-offload that initial read is an upstream follow-up.
+Eager planning completes file discovery and retains tasks even for queries
+that stop early. Repeated provider scans repeat planning. The planning caller
+must support metadata I/O: Iceberg's initial manifest-list read still runs on
+that runtime, even when the table has a separate I/O runtime.
 
-Planning the whole file list earlier adds metadata I/O and retained-task memory
-even when a query stops early (for example, `LIMIT`), and equivalent provider
-`scan()` calls currently repeat planning. No performance improvement is claimed
-by this option alone. A position-delete fixture verifies eager/lazy row counts;
-equality deletes and cross-partition delete-cache reuse still need dedicated
-validation before enabling it by default.
-
-See [the planning API discussion](eager-planning.md) for the relationship to
-distributed planning and the proposed upstream metadata and reader-settings APIs.
+The `iceberg_local` prefix allows these options to coexist with DataFusion
+Distributed's `iceberg` options.
